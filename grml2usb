@@ -28,6 +28,7 @@ import sys
 import tempfile
 import time
 import uuid
+import parted
 
 # The line following this line is patched by debian/rules and tarball.sh.
 PROG_VERSION = '***UNRELEASED***'
@@ -95,6 +96,8 @@ parser.add_option("--quiet", dest="quiet", action="store_true",
                   help="do not output anything but just errors on console")
 parser.add_option("--remove-bootoption", dest="removeoption", action="append",
                   help="regex for removing existing bootoptions")
+parser.add_option("--set-bootflag", dest="setbootflag", action="store_true",
+                  help="set bootflag on device")
 parser.add_option("--skip-addons", dest="skipaddons", action="store_true",
                   help="do not install /boot/addons/ files")
 parser.add_option("--skip-grub-config", dest="skipgrubconfig", action="store_true",
@@ -310,22 +313,33 @@ def check_uid_root():
     if not os.geteuid() == 0:
         sys.exit("Error: please run this script with uid 0 (root).")
 
+def get_device_from_partition(path):
+    if path[-1:].isdigit():
+        boot_dev = re.match(r'(.*?)\d*$', path).group(1)
+    else:
+        boot_dev = path
+    return boot_dev
+
+def get_partition_for_path(path):
+    boot_dev = get_device_from_partition(path)
+
+    d = parted.getDevice(boot_dev)
+    disk = parted.Disk(d)
+    return disk.getPartitionByPath(path)
 
 def check_boot_flag(device):
-    if device[-1:].isdigit():
-        boot_dev = re.match(r'(.*?)\d*$', device).group(1)
-    else:
-        boot_dev = device
+    p = get_partition_for_path(device)
 
-    with open(boot_dev, 'r') as image:
-        data = image.read(512)
-        bootcode = data[440:]
-        if bootcode[6] == '\x80':
-            logging.debug("bootflag is enabled")
-        else:
-            logging.debug("bootflag is NOT enabled")
+    if p.getFlag(parted.PARTITION_BOOT):
+        logging.debug("bootflag is enabled")
+    else:
+        logging.debug("bootflag is NOT enabled")
+        if not options.setbootflag:
             raise VerifyException("Device %s does not have the bootflag set. "
-                "Please enable it to be able to boot." % boot_dev)
+                "Please enable it to be able to boot." % device)
+        else:
+            logging.debug("setting bootflag on %s" % device)
+            p.setFlag(parted.PARTITION_BOOT)
 
 
 def mkfs_fat16(device):
@@ -437,10 +451,7 @@ def install_grub(device):
                 # If using --grub-mbr then make sure we install grub in MBR instead of PBR
                 if options.grubmbr:
                     logging.debug("Using option --grub-mbr ...")
-                    if device[-1:].isdigit():
-                        grub_device = re.match(r'(.*?)\d*$', device).group(1)
-                    else:
-                        grub_device = device
+                    grub_device = get_device_from_partition(device)
                 else:
                     grub_device = device
 
@@ -693,6 +704,23 @@ def check_for_usbdevice(device):
     return 1
 
 
+def check_free_space(partition, isos):
+    """Check whether specified partition has enough space for the ISOs.
+
+    @partition: device name of partition
+    @isos: isos to be installed"""
+
+    size = 0
+    for iso in isos:
+        s = os.stat(iso)
+        size += s.st_size
+
+    p = get_partition_for_path(partition)
+    if size > p.getSize('B'):
+        raise CriticalException(
+                "Partition %s has not enough space to install "
+                "the requested ISOs." % (partition))
+
 def check_for_fat(partition):
     """Check whether specified partition is a valid VFAT/FAT16 filesystem
 
@@ -702,18 +730,13 @@ def check_for_fat(partition):
         raise CriticalException("Failed to read device %s"
                 " (wrong UID/permissions or device/directory not present?)" % partition)
 
-    try:
-        udev_info = subprocess.Popen(["/sbin/blkid", "-s", "TYPE", "-o", "value", partition],
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        filesystem = udev_info.communicate()[0].rstrip()
+    p = get_partition_for_path(partition)
+    filesystem = p.fileSystem.type
 
-        if filesystem != "vfat":
-            raise CriticalException(
-                    "Partition %s does not contain a FAT16 filesystem. "
-                    "(Use --fat16 or run mkfs.vfat %s)" % (partition, partition))
-
-    except OSError:
-        raise CriticalException("Sorry, /sbin/blkid not available (install e2fsprogs?)")
+    if filesystem not in ["fat16", "fat32"]:
+        raise CriticalException(
+                "Partition %s does not contain a FAT16 filesystem. "
+                "(Use --fat16 or run mkfs.vfat %s)" % (partition, partition))
 
 
 def mkdir(directory):
@@ -1574,6 +1597,17 @@ def handle_mbr(device):
         sys.exit(1)
 
 
+def handle_size(partition, isos):
+    """Check for FAT specific settings and options
+
+    @partition: device that should checked
+    @isos: the isos to be included"""
+    try:
+        check_free_space(partition, isos)
+    except CriticalException, error:
+        logging.critical("Execution failed: %s", error)
+        sys.exit(1)
+
 def handle_vfat(device):
     """Check for FAT specific settings and options
 
@@ -1744,6 +1778,9 @@ def main():
 
     # check for vfat partition
     handle_vfat(device)
+
+    # check for free space
+    handle_size(device, isos)
 
     # main operation (like installing files)
     for iso in isos:
