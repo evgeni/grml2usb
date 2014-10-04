@@ -337,7 +337,7 @@ def check_boot_flag(device):
             logging.debug("bootflag is enabled on %s" % device)
             return
     except ImportError, e:
-        pass
+        logging.debug("could not import parted, falling back to old bootflag detection")
 
     with open(boot_dev, 'r') as image:
         data = image.read(520)
